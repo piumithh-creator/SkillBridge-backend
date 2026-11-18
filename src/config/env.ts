@@ -12,7 +12,11 @@ const schema = z.object({
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().default(900),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().default(7),
   GEMINI_API_KEY: z.string().optional(),
-  GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
+  GEMINI_MODEL: z.string().default("gemini-3.5-flash"),
+  // Comma-separated models tried in order if the main model is retired (404) or keeps failing
+  GEMINI_FALLBACK_MODELS: z.string().default("gemini-2.5-flash-lite"),
+  // Leave unset to use the model default (recommended for Gemini 3 models)
+  GEMINI_TEMPERATURE: z.string().optional(),
   CLIENT_URL: z.string().default("http://localhost:5173"),
   UPLOAD_DIR: z.string().default("uploads"),
   ADMIN_NAME: z.string().default("Platform Admin"),
@@ -32,5 +36,7 @@ export const env = {
   ...parsed.data,
   isProd: parsed.data.NODE_ENV === "production",
   isTest: parsed.data.NODE_ENV === "test",
-  clientOrigins: parsed.data.CLIENT_URL.split(",").map((s) => s.trim()).filter(Boolean)
+  clientOrigins: parsed.data.CLIENT_URL.split(",").map((s) => s.trim()).filter(Boolean),
+  geminiFallbackModels: parsed.data.GEMINI_FALLBACK_MODELS.split(",").map((s) => s.trim()).filter(Boolean),
+  geminiTemperature: parsed.data.GEMINI_TEMPERATURE && !Number.isNaN(Number(parsed.data.GEMINI_TEMPERATURE)) ? Number(parsed.data.GEMINI_TEMPERATURE) : undefined
 };

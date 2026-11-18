@@ -7,7 +7,6 @@ import { Internship } from "../models/Internship";
 import { StudentProfile } from "../models/StudentProfile";
 import { extractPdfText } from "../services/cv.service";
 import { analyzeCvText, matchCvToInternship } from "../services/gemini.service";
-import { env } from "../config/env";
 import { AppError } from "../utils/AppError";
 import { asyncHandler } from "../utils/asyncHandler";
 import { sendSuccess } from "../utils/response";
@@ -22,13 +21,18 @@ export const analyzeCv = asyncHandler(async (req: Request, res: Response) => {
   } else {
     const profile = await StudentProfile.findOne({ user: req.user!.id }).select("+cvPath");
     if (!profile?.cvPath) throw AppError.badRequest("Upload a CV PDF first, or attach one to this request");
-    buffer = await fs.promises.readFile(path.join(cvDir, path.basename(profile.cvPath)));
+    try {
+      buffer = await fs.promises.readFile(path.join(cvDir, path.basename(profile.cvPath)));
+    } catch {
+      // e.g. the file was lost on a redeploy (ephemeral disk) – tell the student instead of returning a 500
+      throw AppError.badRequest("Your saved CV file could not be found. Please upload your CV again.");
+    }
     fileName = profile.cvOriginalName ?? "cv.pdf";
   }
 
   const text = await extractPdfText(buffer); // 2. extract text (also re-validates PDF)
-  const result = await analyzeCvText(text); // 3-5. Gemini → structured JSON → validated with Zod
-  const saved = await CVAnalysis.create({ student: req.user!.id, fileName, extractedText: text, aiModel: env.GEMINI_MODEL, ...result }); // 6. persist
+  const { data: result, model } = await analyzeCvText(text); // 3-5. Gemini → structured JSON → validated with Zod
+  const saved = await CVAnalysis.create({ student: req.user!.id, fileName, extractedText: text, aiModel: model, ...result }); // 6. persist
 
   const { extractedText: _omit, ...analysis } = saved.toObject();
   void _omit;

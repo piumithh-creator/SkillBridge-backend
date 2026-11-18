@@ -23,6 +23,7 @@ const getClient = async (): Promise<GeminiClient> => {
   return client;
 };
 
+const RETRY_DELAY_MS = process.env.NODE_ENV === "test" ? 1 : 1500;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const parseJson = (raw: string): unknown => {
@@ -30,27 +31,56 @@ const parseJson = (raw: string): unknown => {
   return JSON.parse(cleaned);
 };
 
-export async function generateJson<S extends z.ZodTypeAny>(prompt: string, schema: S): Promise<z.infer<S>> {
+export interface AiResult<T> {
+  data: T;
+  /** The model that actually produced the answer (may be a fallback). */
+  model: string;
+}
+
+/**
+ * Calls Gemini and returns validated JSON.
+ * - 429/503 → wait and retry the same model (max 3 attempts)
+ * - 404 / other 4xx on a model → move on to the next fallback model (e.g. when a model is retired)
+ * - 401/403 → bad key / no permission: stop immediately, fallbacks would fail the same way
+ */
+export async function generateJson<S extends z.ZodTypeAny>(prompt: string, schema: S): Promise<AiResult<z.infer<S>>> {
   const ai = await getClient();
+  const models = [...new Set([env.GEMINI_MODEL, ...env.geminiFallbackModels])];
   let lastError: unknown;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model: env.GEMINI_MODEL,
-        contents: prompt,
-        config: { responseMimeType: "application/json", temperature: 0.2 }
-      });
-      const text = response.text;
-      if (!text) throw new Error("Empty AI response");
-      const validated = schema.safeParse(parseJson(text)); // AI output is untrusted – validate it
-      if (!validated.success) throw new Error("AI response failed validation");
-      return validated.data;
-    } catch (err) {
-      lastError = err;
-      const status = (err as { status?: number })?.status;
-      if (status === 429 || status === 503) await sleep(attempt * 1500);
-      else if (status && status >= 400 && status < 500) break; // bad key / bad request: do not retry
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            ...(env.geminiTemperature !== undefined ? { temperature: env.geminiTemperature } : {})
+          }
+        });
+        const text = response.text;
+        if (!text) throw new Error("Empty AI response");
+        const validated = schema.safeParse(parseJson(text)); // AI output is untrusted – validate it
+        if (!validated.success) throw new Error("AI response failed validation");
+        return { data: validated.data, model };
+      } catch (err) {
+        lastError = err;
+        const status = (err as { status?: number })?.status;
+        if (status === 429 || status === 503) {
+          if (attempt < 3) await sleep(attempt * RETRY_DELAY_MS);
+          continue;
+        }
+        if (status === 401 || status === 403) {
+          console.error("Gemini rejected the API key / permissions:", err instanceof Error ? err.message : err);
+          throw new AppError(502, "The AI service rejected the server's credentials. Please contact the administrator.");
+        }
+        if (status && status >= 400 && status < 500) {
+          console.error(`Gemini model "${model}" failed (${status}):`, err instanceof Error ? err.message : err);
+          break; // model retired / request not supported by this model → try the next model
+        }
+        // empty / invalid JSON / network error → retry the same model
+      }
     }
   }
   console.error("Gemini request failed:", lastError instanceof Error ? lastError.message : lastError);
@@ -86,11 +116,11 @@ ${clean(cvText)}
     cvAnalysisAiSchema
   );
 
-export const matchCvToInternship = (
+export const matchCvToInternship = async (
   cvText: string,
   internship: { title: string; description: string; requiredSkills: string[]; qualifications: string; requirements: string }
 ) =>
-  generateJson(
+  (await generateJson(
     `You are an expert recruiter. Compare the student's CV with the internship.
 ${SAFETY}
 
@@ -115,4 +145,4 @@ Requirements: ${clean(internship.requirements).slice(0, 800)}
 ${clean(cvText)}
 </cv>`,
     matchAiSchema
-  );
+  )).data;
